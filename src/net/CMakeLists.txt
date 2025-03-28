@@ -33,6 +33,10 @@ add_executable(ssl_test ssl_test.cpp)
 target_include_directories(ssl_test PRIVATE ${OPENSSL_INCLUDE_DIRS})
 target_link_libraries(ssl_test PRIVATE ${OPENSSL_LIBRARIES})
 
+add_executable(first_test first_test.cpp)
+target_include_directories(first_test PRIVATE ${LIBUV_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIRS})
+target_link_libraries(first_test PRIVATE ${LIBUV_LIBRARIES} ${OPENSSL_LIBRARIES})
+
 
 
 
