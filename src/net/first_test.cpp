@@ -10,6 +10,16 @@
 #define DEFAULT_BACKLOG 1
 // OPENSSL
 
+long long ctr_current_conns = 0;
+long long ctr_total_handshakes = 0;
+long long ctr_total_conns = 0;
+long long ctr_total_decrypted_app_data = 0;
+void _print_ctrs() {
+    printf("\rcurrent: %lld handshakes: %lld total: %lld decrypted: %lld bytes ", ctr_current_conns,
+           ctr_total_handshakes, ctr_total_conns, ctr_total_decrypted_app_data);
+    fflush(stdout);
+}
+
 void on_connection_close(uv_handle_t* handle);
 void on_sigint_received(uv_signal_t* handle, int sig);
 void on_new_connection(uv_stream_t* server, int status);
@@ -17,11 +27,6 @@ void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf);
 void close_uv_loop(uv_loop_t* loop);
 void ssl_init(const char* certsfile, const char* keyfile);
 
-void print_decrypted_data(const char* buf, const size_t len) {
-    printf("decrypted data: %.*s\n", len, buf);
-    // const char* str = "hello!";
-    // client.queue_write(str, sizeof(str));
-}
 
 /// @brief
 /// @param req @warning req type should be write_req_t*, which is actually
@@ -29,17 +34,29 @@ void print_decrypted_data(const char* buf, const size_t len) {
 /// @param status
 void on_write(uv_write_t* req, int status) {
     if (status) {
-        fprintf(stderr, "server write error %s (%d)\n", uv_strerror(status),
-                status);
-    
-    }
-    free(req->bufs);
+        fprintf(stderr, "server write error (%d) %s\n", status,
+                uv_strerror(status));
+        }
+    // free(req->bufs);
+    free(req->data);
     free(req);
     // delete req;
 }
+
+void close_encrypt_handle(uv_handle_t* handle){
+    // free(handle->data);
+    delete(handle->data);
+    free(handle);
+}
+
 class SSLClient {
     SSL* ssl;
-    BIO *rbio, *wbio;
+    BIO* rbio; // SSL reads from, we write to
+    BIO* wbio; // SSL writes to, we read from
+    uv_stream_t* wstream = nullptr;
+    /// @brief on decrypted data available
+    /// @param out buffer to write. sizeof(data) <= n unencrypted bytes
+    void (*on_decrypted_cb)(char* data, const size_t len, SSLClient* client);
 
     struct buf_t {
         char* buf = nullptr;
@@ -54,17 +71,45 @@ class SSLClient {
             len += n;
         }
     };
-    buf_t* to_encrypt_buf = new buf_t(); // data waiting to be encrypted by SSL
-    void create_write_req(uv_stream_t* wstream, char* data, const size_t n){
+    // buf_t* to_encrypt_buf = new buf_t(); // data waiting to be encrypted by
+    // SSL
+
+
+    struct _to_encrypt_data {
+        SSLClient* client;
+        char* buf;
+        size_t len;
+        _to_encrypt_data(SSLClient* client, char* data, size_t n)
+            : client(client), buf(data), len(n) {}
+    };
+    /// @brief Encrypts data and queues socket writing
+    /// @param async @warning async->data should be the pointer to
+    /// _to_encrypt_data, so it can queue the socket write with data
+    static void on_do_encrypt(uv_async_t* async){
+        _to_encrypt_data& data = *static_cast<_to_encrypt_data*>(async->data);
+        int n = SSL_write(data.client->ssl, data.buf, data.len);
+        // there are data to encrypt
+        if (n > 0){
+            // make write request
+            char buf[256];
+            do {
+                n = BIO_read(data.client->wbio, buf, sizeof(buf));
+                if (n > 0)
+                    data.client->queue_socket_write(buf, n);
+                else if (!BIO_should_retry(data.client->wbio))
+                    return;
+            } while (n > 0);
+        }
+        uv_close((uv_handle_t*) async, close_encrypt_handle);
+    }
+    void queue_socket_write(char* data, const size_t n){
         uv_write_t* req = (uv_write_t*)malloc(sizeof(uv_write_t));
         uv_buf_t* buf = (uv_buf_t*)malloc(sizeof(uv_buf_t));
         *buf = uv_buf_init(data, n);
+        req->data = buf;  // for freeing buf in on_write()
         uv_write(req, wstream, buf, 1, on_write);
     }
 
-    /// @brief on decrypted data available
-    /// @param out buffer to write. sizeof(out) <= n unencrypted bytes
-    void (*on_decrypted_cb)(const char* out, const size_t len);
 
 
     enum class SSLStatus {
@@ -84,39 +129,39 @@ class SSLClient {
         }
     }
 
-    /// @brief process data: to_encrypt_buf -> SSL encryption -> libuv write_req
-    /// @return true on fail
-    bool do_encrypt(uv_stream_t* wstream) {
-        while (to_encrypt_buf->len > 0){
-            int n = SSL_write(ssl, to_encrypt_buf->buf, to_encrypt_buf->len);
-            // there are data to encrypt
-            if (n > 0){
-                // move remaining after SSL_write bytes to begin of the to_encrypt_buf
-                if (n < to_encrypt_buf->len)
-                    memmove(to_encrypt_buf->buf, to_encrypt_buf->buf+n, to_encrypt_buf->len-n);
-                to_encrypt_buf->len -= n;
-                // free empty memory
-                to_encrypt_buf->buf = (char*)realloc(to_encrypt_buf->buf, to_encrypt_buf->len);
 
-                // make write request
-                char buf[256];
-                do {
-                    n = BIO_read(wbio, buf, sizeof(buf));
-                    if (n > 0)
-                        create_write_req(wstream, buf, n);
-                    else if (!BIO_should_retry(wbio))
-                        return true;
-                } while (n > 0);
-            }
-            // end of to_encrypt_buf;
-            if (n == 0) break;
-        }
-        return 0;
-    }
+    // /// @brief process data: to_encrypt_buf -> SSL encryption -> libuv write_req
+    // /// @return true on fail
+    // void do_encrypt(uv_async_t* async_handle) {
+    //     while (to_encrypt_buf->len > 0){
+    //         int n = SSL_write(ssl, to_encrypt_buf->buf, to_encrypt_buf->len);
+    //         // there are data to encrypt
+    //         if (n > 0){
+    //             // move remaining after SSL_write bytes to begin of the to_encrypt_buf
+    //             if (n < to_encrypt_buf->len)
+    //                 memmove(to_encrypt_buf->buf, to_encrypt_buf->buf+n, to_encrypt_buf->len-n);
+    //             to_encrypt_buf->len -= n;
+    //             // free empty memory
+    //             to_encrypt_buf->buf = (char*)realloc(to_encrypt_buf->buf, to_encrypt_buf->len);
+
+    //             // make write request
+    //             char buf[256];
+    //             do {
+    //                 n = BIO_read(wbio, buf, sizeof(buf));
+    //                 if (n > 0)
+    //                     queue_socket_write((uv_stream_t*)async_handle->data, buf, n);
+    //                 else if (!BIO_should_retry(wbio))
+    //                     return;
+    //             } while (n > 0);
+    //         }
+    //         // end of to_encrypt_buf;
+    //         if (n == 0) break;
+    //     }
+    // }
 
 public:
     
-    SSLClient(SSL_CTX* ctx, void (*on_decrypted_cb)(const char* out, const size_t len)) {
+    SSLClient(SSL_CTX* ctx, void (*on_decrypted_cb)(char* data, const size_t len, SSLClient* client)) {
         rbio = BIO_new(BIO_s_mem());
         wbio = BIO_new(BIO_s_mem());
         ssl = SSL_new(ctx);
@@ -128,14 +173,14 @@ public:
 
     /// @brief do SSL handshake
     /// @return SSLStatus::OK - handshake done.
-    SSLStatus do_handshake(uv_stream_t* wstream) {
+    SSLStatus do_handshake() {
         int n = SSL_do_handshake(ssl);
         if (get_ssl_status(ssl, n) == SSLStatus::WANT_IO) {
             char buf[256];
             do {
                 n = BIO_read(wbio, buf, sizeof(buf));
                 if (n > 0)
-                    create_write_req(wstream, buf, n);
+                    queue_socket_write(buf, n);
                 else if (n == 0)
                     return SSLStatus::WANT_IO;
                 else if (!BIO_should_retry(wbio))
@@ -145,19 +190,17 @@ public:
         return SSLStatus::OK;
     }
 
-    /// @brief encrypt and write data
-    /// @param in unencrypted input
-    /// @param len size of *in
-    void queue_write(const char* in, const size_t len){
-        to_encrypt_buf->queue_data(in, len);
+    void queue_encrypt_and_write(char* data, const size_t n) {
+        uv_async_t* handle = (uv_async_t*)malloc(sizeof(uv_async_t));
+        handle->data = new _to_encrypt_data(
+            this, data, n);  // TODO: this is unsafe because client may
+                             // close while callback is still in queue
+        uv_async_init(wstream->loop, handle, on_do_encrypt);
+        uv_async_send(handle);
     }
-
-    
 
     ~SSLClient(){
         SSL_free(ssl);
-        free(to_encrypt_buf->buf);
-        delete(to_encrypt_buf);
     }
 
     static void on_read_after_handshake(uv_stream_t* client, ssize_t nread,
@@ -178,8 +221,10 @@ public:
                     char buf[256];
                     n = SSL_read(ssl_client.ssl, buf, sizeof(buf));
                     // call user callback
-                    if (n > 0)
-                        ssl_client.on_decrypted_cb(buf, n);
+                    if (n > 0){
+                        ctr_total_decrypted_app_data += n;
+                        ssl_client.on_decrypted_cb(buf, n, &ssl_client);
+                    }
                 } while (n > 0);
                 SSLStatus ret = get_ssl_status(ssl_client.ssl, n);
                 if (ret == SSLStatus::WANT_IO){
@@ -187,7 +232,7 @@ public:
                         char buf[256];
                         n = BIO_read(ssl_client.wbio, buf, sizeof(buf));
                         if (n > 0)
-                            ssl_client.create_write_req((uv_stream_t*)client, buf, n);
+                            ssl_client.queue_socket_write(buf, n);
                         else if (!BIO_should_retry(ssl_client.wbio))
                             return;
                     } while (n > 0);
@@ -217,7 +262,7 @@ public:
                 nread -= n;
 
                 // try handshake
-                switch (ssl_client.do_handshake(client)) {
+                switch (ssl_client.do_handshake()) {
                     case SSLStatus::WANT_IO:
                         continue;
                     case SSLStatus::FAIL:
@@ -228,6 +273,9 @@ public:
                         uv_read_start((uv_stream_t*)client, on_alloc,
                                       on_read_after_handshake);
                         // printf("ssl handshake done\n");
+                        ctr_total_handshakes++;
+                        _print_ctrs();
+
                 }
             }
         }
@@ -241,7 +289,15 @@ public:
         // if nread <= 0
         free(rbuf->base);
     }
+
+    void set_wstream(uv_stream_t* stream) { this->wstream = stream; }
 };
+void print_decrypted_data(char* buf, const size_t len, SSLClient* client) {
+    client->queue_encrypt_and_write(buf, len);
+    _print_ctrs();
+    printf("text: (%lu) %.*s", len, len, buf);
+    if (buf[len - 1] != '\n') puts("\n");
+}
 
 SSL_CTX *ssl_context = nullptr;
 int main(){
@@ -250,6 +306,7 @@ int main(){
     uv_signal_t sigint;
     uv_signal_init(main_loop, &sigint);
     uv_signal_start(&sigint, on_sigint_received, SIGINT);
+    signal(SIGPIPE, SIG_IGN);
 
     ssl_init("server.crt", "server.key");
 
@@ -260,7 +317,7 @@ int main(){
     uv_tcp_bind(&server, (const struct sockaddr*)&addr, 0);
     int r = uv_listen((uv_stream_t*)&server, DEFAULT_BACKLOG, on_new_connection);
     if (r) {
-        warnx("tcp listen error %s (%d)", uv_strerror(r));
+        warnx("tcp listen error (%d) %s", r, uv_strerror(r));
         return 1;
     }
 
@@ -268,7 +325,7 @@ int main(){
     int exit_code = uv_run(main_loop, UV_RUN_DEFAULT);
 
 
-    printf("the loop is over (%d)", exit_code);
+    printf("the loop is over (%d)\n", exit_code);
     // free(main_loop); // dont free the default loop
     main_loop = nullptr;
     return exit_code;
@@ -302,13 +359,19 @@ void on_new_connection(uv_stream_t* server, int status){
     uv_tcp_init(server->loop, client);
     if (uv_accept(server, (uv_stream_t*)client) == 0){
         // printf("new client\n");
+        ctr_total_conns++;
+        ctr_current_conns++;
+        _print_ctrs();
         SSLClient* ssl_client = new SSLClient(ssl_context, print_decrypted_data);
+        ssl_client->set_wstream((uv_stream_t*) client);
         client->data = ssl_client;
         uv_read_start((uv_stream_t*) client, on_alloc, SSLClient::on_read_before_handshake);
     }
 }
 void on_connection_close(uv_handle_t* handle) {
-    // printf("client disconnected\n");
+    printf("client disconnected\n");
+    ctr_current_conns--;
+    _print_ctrs();
     delete (SSLClient*)handle->data;
     free(handle);
 }
@@ -316,7 +379,6 @@ void on_connection_close(uv_handle_t* handle) {
 void ssl_init(const char* certsfile, const char* keyfile) {
     SSL_library_init();
     OpenSSL_add_all_algorithms();
-    const unsigned char session_cache_id[] = "SSL_TEST_01_VERSIYA";
     ssl_context = SSL_CTX_new(TLS_server_method());
     if (ssl_context == nullptr) {
         ERR_print_errors_fp(stderr);
@@ -348,13 +410,17 @@ void ssl_init(const char* certsfile, const char* keyfile) {
              "Error loading the server private key file, "
              "possible key/cert mismatch???");
     }
+// #define DISABLE_SESSION_CACHING
+#ifndef DISABLE_SESSION_CACHING
     // Enable SSL_SESSION caching
+    const unsigned char session_cache_id[] = "SSL_TEST_01_VERSIYA";
     SSL_CTX_set_session_id_context(ssl_context, session_cache_id,
                                    sizeof(session_cache_id));
     SSL_CTX_set_session_cache_mode(ssl_context, SSL_SESS_CACHE_SERVER);
     // How many client TLS sessions to cache.
     // The default is 20k (SSL_SESSION_CACHE_MAX_SIZE_DEFAULT)
     SSL_CTX_sess_set_cache_size(ssl_context, 64);
+#endif
     // t in seconds. the default is two hours
     SSL_CTX_set_timeout(ssl_context, 3600);
 
