@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <uv.h>
+#include "test_net_lib.hpp"
 
 // LIBUV
 #define DEFAULT_BACKLOG 1
@@ -43,11 +44,6 @@ void on_write(uv_write_t* req, int status) {
     // delete req;
 }
 
-void close_encrypt_handle(uv_handle_t* handle){
-    // free(handle->data);
-    delete(handle->data);
-    free(handle);
-}
 
 class SSLClient {
     SSL* ssl;
@@ -58,22 +54,12 @@ class SSLClient {
     /// @param out buffer to write. sizeof(data) <= n unencrypted bytes
     void (*on_decrypted_cb)(char* data, const size_t len, SSLClient* client);
 
-    struct buf_t {
-        char* buf = nullptr;
-        size_t len;
-        // TODO: make forward_list here
-        void queue_data(const char* data, const size_t n){
-            if (buf == nullptr)
-                buf = (char*)malloc(len+n);
-            else
-                buf = (char*)realloc(buf, len+n);
-            memcpy(buf+len, data, n);
-            len += n;
-        }
-    };
-    // buf_t* to_encrypt_buf = new buf_t(); // data waiting to be encrypted by
     // SSL
-
+    static void close_encrypt_handle(uv_handle_t* handle) {
+        // free(handle->data);
+        delete ((SSLClient::_to_encrypt_data*)(handle->data));
+        free(handle);
+    }
 
     struct _to_encrypt_data {
         SSLClient* client;
@@ -194,7 +180,7 @@ public:
         uv_async_t* handle = (uv_async_t*)malloc(sizeof(uv_async_t));
         handle->data = new _to_encrypt_data(
             this, data, n);  // TODO: this is unsafe because client may
-                             // close while callback is still in queue
+                             // close while the handle is still in queue
         uv_async_init(wstream->loop, handle, on_do_encrypt);
         uv_async_send(handle);
     }
@@ -203,52 +189,7 @@ public:
         SSL_free(ssl);
     }
 
-    static void on_read_after_handshake(uv_stream_t* client, ssize_t nread,
-                                        const uv_buf_t* rbuf) {
-        // if OK
-        if (nread > 0) {
-            SSLClient& ssl_client = *static_cast<SSLClient*>(client->data);
-            char* p_data = rbuf->base;
-            while (nread > 0) {
-                // pass data
-                int n = BIO_write(ssl_client.rbio, p_data, nread);
-                if (n <= 0) return;  // on BIO error
-                p_data += n;
-                nread -= n;
-
-                // try decoding
-                do {
-                    char buf[256];
-                    n = SSL_read(ssl_client.ssl, buf, sizeof(buf));
-                    // call user callback
-                    if (n > 0){
-                        ctr_total_decrypted_app_data += n;
-                        ssl_client.on_decrypted_cb(buf, n, &ssl_client);
-                    }
-                } while (n > 0);
-                SSLStatus ret = get_ssl_status(ssl_client.ssl, n);
-                if (ret == SSLStatus::WANT_IO){
-                    do {
-                        char buf[256];
-                        n = BIO_read(ssl_client.wbio, buf, sizeof(buf));
-                        if (n > 0)
-                            ssl_client.queue_socket_write(buf, n);
-                        else if (!BIO_should_retry(ssl_client.wbio))
-                            return;
-                    } while (n > 0);
-                }
-            }
-        }
-        // if ERROR
-        if (nread < 0) {
-            if (nread != UV_EOF)
-                warnx("read error (%ld) %s", nread, uv_err_name(nread));
-            uv_close((uv_handle_t*)client, on_connection_close);
-        }
-        // if nread <= 0
-        free(rbuf->base);
-    }
-    static void on_read_before_handshake(uv_stream_t* client, ssize_t nread,
+    static void on_socket_read(uv_stream_t* client, ssize_t nread,
                                   const uv_buf_t* rbuf) {
         // if OK
         if (nread > 0) {
@@ -260,22 +201,41 @@ public:
                 if (n <= 0) return; // on BIO error
                 p_data += n;
                 nread -= n;
-
-                // try handshake
-                switch (ssl_client.do_handshake()) {
-                    case SSLStatus::WANT_IO:
-                        continue;
-                    case SSLStatus::FAIL:
-                        warnx("ssl handshake failed");
-                        return;
-                    case SSLStatus::OK:
-                        uv_read_stop(client);
-                        uv_read_start((uv_stream_t*)client, on_alloc,
-                                      on_read_after_handshake);
-                        // printf("ssl handshake done\n");
-                        ctr_total_handshakes++;
-                        _print_ctrs();
-
+                if (!SSL_is_init_finished(ssl_client.ssl)){
+                    // try handshake
+                    switch (ssl_client.do_handshake()) {
+                        case SSLStatus::WANT_IO:
+                            continue;
+                        case SSLStatus::FAIL:
+                            warnx("ssl handshake failed");
+                            return;
+                        case SSLStatus::OK:
+                            // printf("ssl handshake done\n");
+                            ctr_total_handshakes++;
+                            _print_ctrs();
+                    }
+                } else {
+                    // try decoding
+                    do {
+                        char buf[256];
+                        n = SSL_read(ssl_client.ssl, buf, sizeof(buf));
+                        // call user callback
+                        if (n > 0) {
+                            ctr_total_decrypted_app_data += n;
+                            ssl_client.on_decrypted_cb(buf, n, &ssl_client);
+                        }
+                    } while (n > 0);
+                    SSLStatus ret = get_ssl_status(ssl_client.ssl, n);
+                    if (ret == SSLStatus::WANT_IO) {
+                        do {
+                            char buf[256];
+                            n = BIO_read(ssl_client.wbio, buf, sizeof(buf));
+                            if (n > 0)
+                                ssl_client.queue_socket_write(buf, n);
+                            else if (!BIO_should_retry(ssl_client.wbio))
+                                return;
+                        } while (n > 0);
+                    }
                 }
             }
         }
@@ -289,6 +249,10 @@ public:
         // if nread <= 0
         free(rbuf->base);
     }
+
+    enum Commands { OK='a', VERSION='V', ORDER_PIZZA = 'p' };
+    CommandSender<Commands> send_data{
+        [this](char* data, size_t n) { queue_encrypt_and_write(data, n); }};
 
     void set_wstream(uv_stream_t* stream) { this->wstream = stream; }
 };
@@ -350,6 +314,17 @@ void on_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     buf->len = suggested_size;
 }
 
+void on_data_decrypted(char* data, const size_t len, SSLClient* client) {
+    // client->queue_encrypt_and_write(data, len);
+    // client->send_data(SSLClient::Commands::ORDER_PIZZA, "");
+    char data_copy[len+1];
+    memcpy(data_copy, data, len);
+    data_copy[len] = '\0';
+    client->send_data(SSLClient::Commands::ORDER_PIZZA, data_copy);
+    _print_ctrs();
+    printf("text: (%lu) %.*s", len, len, data);
+    if (data[len - 1] != '\n') puts("\n");
+}
 void on_new_connection(uv_stream_t* server, int status){
     if (status < 0){
         warnx("connection accept error (%d) %s", status, uv_strerror(status));
@@ -362,10 +337,10 @@ void on_new_connection(uv_stream_t* server, int status){
         ctr_total_conns++;
         ctr_current_conns++;
         _print_ctrs();
-        SSLClient* ssl_client = new SSLClient(ssl_context, print_decrypted_data);
+        SSLClient* ssl_client = new SSLClient(ssl_context, on_data_decrypted);
         ssl_client->set_wstream((uv_stream_t*) client);
         client->data = ssl_client;
-        uv_read_start((uv_stream_t*) client, on_alloc, SSLClient::on_read_before_handshake);
+        uv_read_start((uv_stream_t*) client, on_alloc, SSLClient::on_socket_read);
     }
 }
 void on_connection_close(uv_handle_t* handle) {
